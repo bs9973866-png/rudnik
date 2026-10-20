@@ -1,0 +1,126 @@
+name: Build Rudnik APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+    steps:
+      - name: Checkout Rudnik branding and build files
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Checkout PojavLauncher source
+        uses: actions/checkout@v4
+        with:
+          repository: bs9973866-png/PojavLauncher
+          ref: v3_openjdk
+          token: ${{ github.token }}
+          submodules: recursive
+          path: source
+
+      - name: Apply Rudnik resources and branding
+        run: |
+          set -euo pipefail
+          cp -a patch/app_pojavlauncher/. source/app_pojavlauncher/
+          cd source
+          bash ../patch/.github/scripts/apply-rudnik-branding.sh
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Get LTW
+        run: |
+          cd source/app_pojavlauncher/libs
+          wget -q https://github.com/PojavLauncherTeam/LTW/releases/latest/download/ltw-release.aar
+
+      - name: Get Java runtimes from the last official release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rel
+          cd /tmp/rel
+          gh release view --repo PojavLauncherTeam/PojavLauncher --json tagName,assets -q '.tagName, (.assets[] | "\(.size)  \(.name)")'
+          gh release download --repo PojavLauncherTeam/PojavLauncher --pattern '*.apk' --dir . || true
+          APK=$(ls -S *.apk 2>/dev/null | head -n1 || true)
+          if [ -z "$APK" ]; then
+            echo "::error::В последнем релизе PojavLauncher не найден APK с Java-средами."
+            exit 1
+          fi
+          unzip -q "$APK" 'assets/components/jre*' -d x || true
+          DEST="$GITHUB_WORKSPACE/source/app_pojavlauncher/src/main/assets/components"
+          mkdir -p "$DEST"
+          found=0
+          for d in x/assets/components/jre*; do
+            [ -d "$d" ] && cp -r "$d" "$DEST/" && found=1
+          done
+          if [ "$found" = 0 ]; then
+            echo "::error::В APK не найдены assets/components/jre*."
+            exit 1
+          fi
+          ls "$DEST"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11'
+
+      - name: Build helper JARs
+        working-directory: source
+        run: |
+          set -euo pipefail
+          chmod +x scripts/languagelist_updater.sh
+          ./scripts/languagelist_updater.sh
+          gradle :jre_lwjgl3glfw:build --no-daemon
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build debug APK
+        working-directory: source
+        run: |
+          set -euo pipefail
+          gradle :app_pojavlauncher:assembleDebug --no-daemon --stacktrace
+          mkdir -p out
+          mv app_pojavlauncher/build/outputs/apk/debug/app_pojavlauncher-debug.apk out/rudnik-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rudnik-debug-apk
+          path: source/out/rudnik-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=rudnik-latest
+          APK="$GITHUB_WORKSPACE/source/out/rudnik-debug.apk"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$APK" \
+              --title "Рудник — APK (последняя сборка)" \
+              --notes "Автоматическая debug-сборка Rudnik через GitHub Actions." \
+              --target main --repo "$GITHUB_REPOSITORY" ||
+            gh release upload "$TAG" "$APK" --clobber --repo "$GITHUB_REPOSITORY"
+          fi
